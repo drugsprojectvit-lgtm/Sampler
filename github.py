@@ -1,7 +1,6 @@
 import os
 import json
 import asyncio
-import sqlite3
 import shutil
 import stat
 import errno
@@ -16,6 +15,7 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional, Set, Any, Tuple, Generator
 from collections import defaultdict
+from sampler.storage import GraphStorageService, HybridVectorStoreService
 from git import Repo
 from openai import AsyncOpenAI
 from pypdf import PdfReader
@@ -2530,101 +2530,6 @@ class ImportResolver:
 
 # --- 4. Vector Embedding System ---
 
-class GraphStorageService:
-    """SQLite-backed graph storage that mimics a graph DB with Cypher-like query helpers."""
-
-    def __init__(self, db_path: str = GRAPH_DB_FILE):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
-        self._init_schema()
-
-    def _init_schema(self):
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS functions (
-            id TEXT PRIMARY KEY,
-            repo TEXT,
-            file TEXT,
-            name TEXT,
-            node_type TEXT,
-            payload TEXT
-        )
-        """)
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS calls (
-            source_id TEXT,
-            target_name TEXT,
-            FOREIGN KEY(source_id) REFERENCES functions(id)
-        )
-        """)
-        self.conn.commit()
-
-    def upsert_repo_graph(self, repo_name: str, graph: Dict[str, Dict], changed_files: Optional[Set[str]] = None):
-        changed_files = changed_files or {node.get('file') for node in graph.values()}
-        changed_files = {f for f in changed_files if f}
-        if changed_files:
-            placeholders = ','.join(['?'] * len(changed_files))
-            self.conn.execute(f"DELETE FROM calls WHERE source_id IN (SELECT id FROM functions WHERE repo = ? AND file IN ({placeholders}))", [repo_name, *changed_files])
-            self.conn.execute(f"DELETE FROM functions WHERE repo = ? AND file IN ({placeholders})", [repo_name, *changed_files])
-
-        for node_id, node in graph.items():
-            payload = json.dumps(node)
-            symbol = node.get('symbol', {})
-            self.conn.execute(
-                "INSERT OR REPLACE INTO functions (id, repo, file, name, node_type, payload) VALUES (?, ?, ?, ?, ?, ?)",
-                (node_id, repo_name, node.get('file'), symbol.get('name', node_id), symbol.get('type', ''), payload)
-            )
-            for call in symbol.get('calls', []):
-                self.conn.execute("INSERT INTO calls (source_id, target_name) VALUES (?, ?)", (node_id, call))
-
-        self.conn.commit()
-
-    def impact_analysis(self, target_name: str, max_depth: int = 4) -> List[str]:
-        frontier = [target_name]
-        impacted = set()
-        depth = 0
-        while frontier and depth < max_depth:
-            placeholders = ','.join(['?'] * len(frontier))
-            rows = self.conn.execute(
-                f"SELECT source_id FROM calls WHERE target_name IN ({placeholders})",
-                frontier
-            ).fetchall()
-            frontier = []
-            for (source_id,) in rows:
-                if source_id not in impacted:
-                    impacted.add(source_id)
-                    frontier.append(source_id.split('::')[-1])
-            depth += 1
-        return sorted(impacted)
-
-
-class HybridVectorStoreService:
-    """Pluggable vector service adapter (Qdrant/Weaviate-ready)."""
-
-    def __init__(self, backend: str = "local", storage_path: str = VECTOR_DB_FILE):
-        self.backend = backend
-        self.storage_path = storage_path
-        self.records: Dict[str, Dict[str, Any]] = {}
-
-    async def upsert_records(self, graph: Dict[str, Dict], changed_ids: Optional[Set[str]] = None):
-        changed_ids = changed_ids or set(graph.keys())
-        for node_id in changed_ids:
-            node = graph.get(node_id)
-            if not node:
-                continue
-            symbol = node.get('symbol', {})
-            text = f"{symbol.get('name', '')} {symbol.get('docstring', '')} {' '.join(symbol.get('arg_names', []))}"
-            self.records[node_id] = {
-                "text": text[:4000],
-                "repo": node.get('repo'),
-                "file": node.get('file')
-            }
-
-        os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
-        with open(self.storage_path, 'w', encoding='utf-8') as f:
-            json.dump(self.records, f, indent=2)
-
-
 class VectorEmbeddingStore:
     """Stores and searches function embeddings using FAISS + sparse hybrid scoring."""
 
@@ -3534,8 +3439,17 @@ async def build_multi_symbol_graph(
 
     multi_graph = {}
     resolvers = {}
-    graph_storage = GraphStorageService()
-    hybrid_vector_service = HybridVectorStoreService()
+    graph_storage = None
+    hybrid_vector_service = None
+    try:
+        graph_storage = GraphStorageService()
+    except Exception as storage_err:
+        print(f"⚠️ Neo4j graph storage disabled: {storage_err}")
+
+    try:
+        hybrid_vector_service = HybridVectorStoreService()
+    except Exception as vector_err:
+        print(f"⚠️ Qdrant vector storage disabled: {vector_err}")
 
     for repo_name, files_data in multi_repo_data.items():
         prev_repo_hashes = (previous_file_hashes or {}).get(repo_name, {})
@@ -3568,7 +3482,8 @@ async def build_multi_symbol_graph(
 
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
-        graph_storage.upsert_repo_graph(repo_name, graph, changed_files=changed_files if previous_graph else None)
+        if graph_storage:
+            graph_storage.upsert_repo_graph(repo_name, graph, changed_files=changed_files if previous_graph else None)
 
     multi_graph = link_cross_repo_dependencies(multi_graph)
     dep_conflicts = _detect_dependency_version_conflicts(multi_graph)
@@ -3624,8 +3539,9 @@ async def build_multi_symbol_graph(
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
 
-    for repo_name, graph in multi_graph.items():
-        await hybrid_vector_service.upsert_records(graph)
+    if hybrid_vector_service:
+        for repo_name, graph in multi_graph.items():
+            await hybrid_vector_service.upsert_records(graph)
 
     try:
         export_graph_visualizations(multi_graph, VISUALIZATION_DIR)
