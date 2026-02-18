@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import sqlite3
 import shutil
 import stat
 import errno
@@ -10,7 +11,10 @@ import ast
 import hashlib
 import time
 from difflib import SequenceMatcher
-from typing import List, Dict, Optional, Set, Any, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from abc import ABC, abstractmethod
+from typing import List, Dict, Optional, Set, Any, Tuple, Generator
 from collections import defaultdict
 from git import Repo
 from openai import AsyncOpenAI
@@ -155,6 +159,12 @@ CACHE_FILE = os.path.join(CACHE_DIR, "cache_metadata.json")
 GRAPH_FILE = os.path.join(CACHE_DIR, "symbol_graph.json")
 MEMORY_FILE = os.path.join(CACHE_DIR, "reasoning_memory.json")
 VISUALIZATION_DIR = os.path.join(RUNTIME_ROOT, "visualizations")
+
+
+JOB_QUEUE_FILE = os.path.join(CACHE_DIR, "ingestion_jobs.json")
+GRAPH_DB_FILE = os.path.join(CACHE_DIR, "graph_store.sqlite3")
+VECTOR_DB_FILE = os.path.join(CACHE_DIR, "vector_store.json")
+TREE_SITTER_QUERY_DIR = os.path.join(os.path.dirname(__file__), "queries")
 
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY not found in .env. Please set it.")
@@ -863,6 +873,121 @@ def perform_cleanup():
         except: pass
     print("✅ Cleanup complete.")
 
+# --- Ingestion Job Queue & Source Providers ---
+
+@dataclass
+class FileObject:
+    relative_path: str
+    content: str
+
+
+class SourceProvider(ABC):
+    @abstractmethod
+    def get_source_name(self) -> str:
+        pass
+
+    @abstractmethod
+    def get_files(self) -> Generator[FileObject, None, None]:
+        pass
+
+
+class LocalSource(SourceProvider):
+    def __init__(self, path: str):
+        self.path = os.path.abspath(path)
+
+    def get_source_name(self) -> str:
+        return os.path.basename(self.path.rstrip(os.sep)) or "local_source"
+
+    def get_files(self) -> Generator[FileObject, None, None]:
+        for root, _, files in os.walk(self.path):
+            if '.git' in root:
+                continue
+            for filename in files:
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, self.path)
+                if is_valid_file(filename):
+                    content = read_universal_text(full_path)
+                    if content.strip():
+                        yield FileObject(relative_path=rel_path, content=content)
+
+
+class GitSource(SourceProvider):
+    def __init__(self, url: str):
+        self.url = url
+        self.repo_name = url.split("/")[-1].replace('.git', '')
+
+    def get_source_name(self) -> str:
+        return self.repo_name or "git_repo"
+
+    def get_files(self) -> Generator[FileObject, None, None]:
+        temp_root = Path(TEMP_DIR) / f"{self.get_source_name()}_{int(time.time())}"
+        Repo.clone_from(self.url, str(temp_root))
+        try:
+            for root, _, files in os.walk(temp_root):
+                if '.git' in root:
+                    continue
+                for filename in files:
+                    full_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(full_path, temp_root)
+                    if is_valid_file(filename):
+                        content = read_universal_text(full_path)
+                        if content.strip():
+                            yield FileObject(relative_path=rel_path, content=content)
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+class IngestionJobQueue:
+    def __init__(self, queue_file: str = JOB_QUEUE_FILE):
+        self.queue_file = queue_file
+        os.makedirs(os.path.dirname(queue_file), exist_ok=True)
+
+    def _read_jobs(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.queue_file):
+            return []
+        with open(self.queue_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _write_jobs(self, jobs: List[Dict[str, Any]]):
+        with open(self.queue_file, 'w', encoding='utf-8') as f:
+            json.dump(jobs, f, indent=2)
+
+    def enqueue(self, source_type: str, source: str) -> str:
+        jobs = self._read_jobs()
+        job_id = hashlib.md5(f"{source_type}:{source}:{time.time()}".encode()).hexdigest()[:12]
+        jobs.append({
+            "id": job_id,
+            "source_type": source_type,
+            "source": source,
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time()
+        })
+        self._write_jobs(jobs)
+        return job_id
+
+    def next_job(self) -> Optional[Dict[str, Any]]:
+        jobs = self._read_jobs()
+        for job in jobs:
+            if job.get('status') == 'queued':
+                job['status'] = 'processing'
+                job['updated_at'] = time.time()
+                self._write_jobs(jobs)
+                return job
+        return None
+
+    def mark_done(self, job_id: str, metadata: Optional[Dict[str, Any]] = None):
+        jobs = self._read_jobs()
+        for job in jobs:
+            if job.get('id') == job_id:
+                job['status'] = 'done'
+                job['updated_at'] = time.time()
+                if metadata:
+                    job['metadata'] = metadata
+                break
+        self._write_jobs(jobs)
+
+
 # --- Repository Hashing for Cache Invalidation ---
 def compute_repo_hash(repo_path: str) -> str:
     """Compute hash of all tracked files in repo for cache validation."""
@@ -930,12 +1055,12 @@ async def async_read_file(path, relative_path):
 
 async def handle_github_repo(url, source_id):
     if not url: return None, None
-    
+
     clean_name = url.split("/")[-1].replace(".git", "")
     if not clean_name: clean_name = f"repo_{source_id}"
-    
+
     repo_path = os.path.join(TEMP_DIR, f"{clean_name}_{source_id}")
-    
+
     print(f"🔄 Cloning {clean_name}...")
     try:
         await asyncio.to_thread(Repo.clone_from, url, repo_path)
@@ -944,52 +1069,68 @@ async def handle_github_repo(url, source_id):
         print(f"❌ Git Clone Failed for {url}: {e}")
         return None, None
 
-async def ingest_sources(github_inputs: str):
-    if os.path.exists(TEMP_DIR): 
+
+def _provider_from_job(job: Dict[str, Any]) -> SourceProvider:
+    if job['source_type'] == 'git':
+        return GitSource(job['source'])
+    if job['source_type'] == 'local':
+        return LocalSource(job['source'])
+    raise ValueError(f"Unsupported source type: {job['source_type']}")
+
+
+def _compute_file_hash_map(files_data: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    return {fname: hashlib.md5(data.get('content', '').encode('utf-8')).hexdigest() for fname, data in files_data.items()}
+
+
+async def process_ingestion_jobs() -> Tuple[Dict[str, Dict], Dict[str, str], Dict[str, Dict[str, str]]]:
+    queue = IngestionJobQueue()
+    multi_repo_data: Dict[str, Dict[str, Dict[str, str]]] = {}
+    repo_hashes: Dict[str, str] = {}
+    file_hashes: Dict[str, Dict[str, str]] = {}
+
+    while True:
+        job = queue.next_job()
+        if not job:
+            break
+
+        provider = _provider_from_job(job)
+        repo_name = provider.get_source_name()
+        print(f"📦 Processing job {job['id']} ({job['source_type']}:{job['source']})")
+
+        files_data: Dict[str, Dict[str, str]] = {}
+        for fobj in provider.get_files():
+            files_data[fobj.relative_path] = {"content": fobj.content}
+
+        multi_repo_data[repo_name] = files_data
+
+        if job['source_type'] == 'local':
+            repo_hashes[repo_name] = compute_repo_hash(job['source'])
+        else:
+            repo_hashes[repo_name] = hashlib.md5(json.dumps(sorted(files_data.keys())).encode()).hexdigest()
+
+        file_hashes[repo_name] = _compute_file_hash_map(files_data)
+        queue.mark_done(job['id'], metadata={"repo": repo_name, "files": len(files_data)})
+
+    return multi_repo_data, repo_hashes, file_hashes
+
+
+async def ingest_sources(source_inputs: str):
+    if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR, onerror=handle_remove_readonly)
     os.makedirs(TEMP_DIR, exist_ok=True)
-    
-    git_urls = [s.strip() for s in github_inputs.split(',') if s.strip()]
-    
-    dir_tasks = []
-    for i, url in enumerate(git_urls):
-        dir_tasks.append(handle_github_repo(url, i))
-        
-    repo_results = await asyncio.gather(*dir_tasks)
-    
-    multi_repo_data = {}
-    read_tasks = []
-    repo_hashes = {}
-    
-    for repo_path, repo_name in repo_results:
-        if not repo_path: continue
-        
-        if repo_name not in multi_repo_data:
-            multi_repo_data[repo_name] = {}
-            repo_hashes[repo_name] = compute_repo_hash(repo_path)
-            
-        for root, _, files in os.walk(repo_path):
-            if ".git" in root: continue
-            for file in files:
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, repo_path)
-                
-                if is_valid_file(file):
-                    read_tasks.append((async_read_file(full_path, rel_path), repo_name, rel_path))
 
-    print(f"\n📖 Reading files across {len(multi_repo_data)} repositories...")
-    
-    file_contents = await asyncio.gather(*[t[0] for t in read_tasks])
-    
-    total_files = 0
-    for i, content in enumerate(file_contents):
-        _, r_name, r_path = read_tasks[i]
-        if content and content.strip():
-            multi_repo_data[r_name][r_path] = {"content": content}
-            total_files += 1
+    queue = IngestionJobQueue()
+    source_tokens = [s.strip() for s in source_inputs.split(',') if s.strip()]
+    if not source_tokens:
+        return {}, {}, {}
 
-    print(f"✅ Total Loaded: {total_files} files across {list(multi_repo_data.keys())}.")
-    return multi_repo_data, repo_hashes
+    for source in source_tokens:
+        source_type = 'git' if source.startswith(('http://', 'https://', 'git@')) else 'local'
+        job_id = queue.enqueue(source_type, source)
+        print(f"🧾 Queued ingestion job {job_id} for {source_type} source: {source}")
+
+    return await process_ingestion_jobs()
+
 
 class GlobalExtractor:
     """
@@ -1194,6 +1335,62 @@ class GlobalExtractor:
 
 # --- 2. Enhanced Tree-Sitter Parser ---
 
+class TreeSitterQueryRegistry:
+    """Loads tree-sitter .scm query files and provides language-specific captures."""
+
+    DEFAULT_QUERIES = {
+        'python': """
+(function_definition
+  name: (identifier) @function.name
+  body: (block) @function.body) @function.def
+
+(class_definition
+  name: (identifier) @class.name) @class.def
+
+(import_statement) @import
+(import_from_statement) @import
+""",
+        'javascript': """
+(function_declaration
+  name: (identifier) @function.name) @function.def
+
+(class_declaration
+  name: (identifier) @class.name) @class.def
+
+(import_statement) @import
+""",
+        'typescript': """
+(function_declaration
+  name: (identifier) @function.name) @function.def
+
+(class_declaration
+  name: (identifier) @class.name) @class.def
+
+(import_statement) @import
+""",
+        'go': """
+(function_declaration
+  name: (identifier) @function.name) @function.def
+
+(type_declaration
+  (type_spec
+    name: (type_identifier) @class.name)) @class.def
+
+(import_declaration) @import
+""",
+    }
+
+    def __init__(self, query_dir: str = TREE_SITTER_QUERY_DIR):
+        self.query_dir = query_dir
+
+    def get_query_text(self, language_name: str) -> Optional[str]:
+        query_file = os.path.join(self.query_dir, f"{language_name}.scm")
+        if os.path.exists(query_file):
+            with open(query_file, 'r', encoding='utf-8') as f:
+                return f.read()
+        return self.DEFAULT_QUERIES.get(language_name)
+
+
 class TreeSitterParser:
     """
     Production-grade parser using Tree-sitter with fallback to regex.
@@ -1203,6 +1400,7 @@ class TreeSitterParser:
         self.parsers = {}
         self.languages = {}
         self.global_extractor = GlobalExtractor()
+        self.query_registry = TreeSitterQueryRegistry()
         
         if not HAS_TREE_SITTER:
             print("⚠️ Tree-sitter not available, using regex fallback")
@@ -1334,12 +1532,14 @@ class TreeSitterParser:
         globals_data = self.global_extractor.extract_globals_from_content(content, filename)
         formatted_globals = self.global_extractor.format_globals_for_context(globals_data)
 
-        # THEN: Extract functions using tree-sitter or regex
+        # THEN: Extract functions using query-driven tree-sitter, then fallback.
         parser = self.parsers.get(ext)
         if parser:
             try:
                 tree = parser.parse(bytes(content, "utf8"))
-                result = self._extract_symbols(tree.root_node, content, ext)
+                result = self._extract_symbols_with_queries(tree.root_node, content, ext)
+                if not result.get("nodes"):
+                    result = self._extract_symbols(tree.root_node, content, ext)
             except Exception as e:
                 print(f"⚠️ Tree-sitter parse error in {filename}: {e}, using regex fallback")
                 result = self._parse_regex_fallback(content, ext, filename)
@@ -1351,6 +1551,66 @@ class TreeSitterParser:
         result['globals_data'] = globals_data  # Store structured data too
 
         return result
+
+    def _extract_symbols_with_queries(self, root_node, content: str, ext: str) -> Dict[str, Any]:
+        """Extract symbols with externalized tree-sitter .scm queries."""
+        language_name_map = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.jsx': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.go': 'go'
+        }
+        language_name = language_name_map.get(ext)
+        if not language_name:
+            return {"nodes": [], "imports": [], "globals": ""}
+
+        lang = self.languages.get(language_name)
+        query_text = self.query_registry.get_query_text(language_name)
+        if not lang or not query_text:
+            return {"nodes": [], "imports": [], "globals": ""}
+
+        query = lang.query(query_text)
+        captures = query.captures(root_node)
+        nodes, imports = [], []
+        pending = {}
+
+        for node, capture_name in captures:
+            if capture_name == 'import':
+                imports.append(self._get_text(node, content))
+                continue
+
+            nid = (node.start_byte, node.end_byte)
+            entry = pending.setdefault(nid, {"node": node, "kind": None, "name": None})
+            if capture_name.startswith('function.'):
+                entry['kind'] = 'function'
+            elif capture_name.startswith('class.'):
+                entry['kind'] = 'class'
+            if capture_name.endswith('.name'):
+                entry['name'] = self._get_text(node, content)
+
+        for info in pending.values():
+            ast_node = info['node']
+            symbol_code = self._get_text(ast_node, content)
+            symbol_name = info['name'] or f"anonymous_{ast_node.start_point[0]+1}"
+            kind = info['kind'] or 'function'
+            comment_meta = self._extract_symbol_docs(ast_node, content, symbol_code, language_name)
+            semantic_meta = self._extract_semantic_metadata_from_node(ast_node, content)
+            calls = self._extract_api_calls(symbol_code)
+            nodes.append({
+                "name": symbol_name,
+                "type": kind,
+                "code": symbol_code,
+                "calls": calls,
+                "api_route": None,
+                "api_outbound": calls,
+                "bases": [],
+                **comment_meta,
+                **semantic_meta
+            })
+
+        return {"nodes": nodes, "imports": list(dict.fromkeys(imports)), "globals": ""}
 
     def _extract_symbols(self, root_node, content: str, ext: str) -> Dict[str, Any]:
         """Extract functions, classes, and imports from AST."""
@@ -2089,10 +2349,10 @@ class TreeSitterParser:
 
 class ProjectSummarizer:
     """
-    Generates high-level summaries of files and the overall project architecture.
-    Uses LLM to synthesize information for broader context.
+    Lazy summarization to avoid ingestion-time LLM cost explosion.
+    Generates summaries only on-demand and caches them.
     """
-    
+
     def __init__(self, model_name: str = MODEL_NAME):
         self.model_name = model_name
         self.file_summaries = {}
@@ -2100,88 +2360,40 @@ class ProjectSummarizer:
         self.project_summary = ""
 
     async def summarize_file(self, filename: str, content: str, nodes: List[Dict]) -> str:
-        """Generate a concise summary of a single file."""
-        node_names = [n['name'] for n in nodes[:10]]
-        node_str = ", ".join(node_names)
-        
-        prompt = f"""
-Summarize the following file in 1-2 concise sentences. 
-Focus on its primary responsibility in the system.
-Filename: {filename}
-Key Symbols: {node_str}
-Content Preview: {content[:1000]}
-"""
-        try:
-            res = await safe_chat_completion(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            summary = res.choices[0].message.content.strip()
-            self.file_summaries[filename] = summary
-            return summary
-        except Exception as e:
-            print(f"   ⚠️ Summary failed for {filename}: {e}")
-            return f"Module containing {node_str}"
+        """Create a lightweight, no-LLM signature summary used during indexing."""
+        if filename in self.file_summaries:
+            return self.file_summaries[filename]
+        node_names = [n['name'] for n in nodes[:20]]
+        joined = ", ".join(node_names) if node_names else "No extracted symbols"
+        summary = f"{filename}: symbols => {joined}"
+        self.file_summaries[filename] = summary
+        return summary
 
     async def build_hierarchical_summaries(self, repo_name: str, files_data: Dict[str, Dict]):
-        """Build folder-level summaries from file summaries (hierarchical map)."""
+        """Cheap folder summaries built from cached file signatures only."""
         folder_to_files = defaultdict(list)
         for filename in files_data.keys():
             folder = os.path.dirname(filename) or "."
             folder_to_files[folder].append(filename)
 
-        # Bottom-up summarization by folder depth.
-        for folder in sorted(folder_to_files.keys(), key=lambda f: f.count('/'), reverse=True):
-            file_summaries = [self.file_summaries.get(f, "Source file") for f in folder_to_files[folder][:20]]
-            child_folders = [f for f in folder_to_files.keys() if f != folder and f.startswith(folder + "/") and f.count('/') == folder.count('/') + 1]
-            child_summaries = [self.folder_summaries.get(f"{repo_name}:{cf}", "") for cf in child_folders[:10]]
+        for folder, folder_files in folder_to_files.items():
+            key = f"{repo_name}:{folder}"
+            signatures = [self.file_summaries.get(f, f) for f in folder_files[:20]]
+            self.folder_summaries[key] = f"Folder {folder} contains {len(folder_files)} files. Key files: {', '.join(signatures[:5])}"
 
-            composed = "\n".join([f"- {s}" for s in file_summaries + child_summaries if s])
-            if not composed:
-                composed = "- Source code folder"
-
-            prompt = f"""
-Summarize this folder in 1-2 concise sentences.
-Repository: {repo_name}
-Folder: {folder}
-Contained Summaries:
-{composed[:2500]}
-"""
-            try:
-                res = await safe_chat_completion(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                self.folder_summaries[f"{repo_name}:{folder}"] = res.choices[0].message.content.strip()
-            except Exception:
-                self.folder_summaries[f"{repo_name}:{folder}"] = f"Folder containing {len(folder_to_files[folder])} files"
-
-    async def generate_project_overview(self, multi_graph: Dict[str, Dict]) -> str:
-        """Synthesize project-level architecture summary."""
-        print("🧠 Generating project architectural overview...", flush=True)
-        
-        file_overviews = []
+    async def generate_project_overview(self, multi_graph: Dict[str, Dict], force_llm: bool = False) -> str:
+        """Generate project overview lazily. Uses deterministic summary unless explicitly requested."""
+        repos = []
         for repo, graph in multi_graph.items():
-            repo_files = set()
-            for node_id, data in graph.items():
-                repo_files.add(data['file'])
-            
-            # Use a larger subset for the overview to be more comprehensive
-            subset = list(repo_files)[:100]
-            summaries = [f"- {f}: {self.file_summaries.get(f, 'Source file')}" for f in subset]
-            if len(repo_files) > 100:
-                summaries.append(f"- ... and {len(repo_files) - 100} more files.")
-            file_overviews.append(f"Repo [{repo}]:\n" + "\n".join(summaries))
-        
-        all_files_str = "\n\n".join(file_overviews)
-        
-        prompt = f"""
-Given the following list of files and their short descriptions, provide a high-level architectural overview of the project.
-Describe the main components, how they interact, and the overall purpose of the system.
-Keep it under 3-4 paragraphs.
+            files = sorted({node.get('file', '') for node in graph.values() if node.get('file')})
+            repos.append(f"{repo}: {len(files)} files, {len(graph)} symbols")
 
-{all_files_str}
-"""
+        deterministic = "Project overview (lazy mode): " + " | ".join(repos)
+        if not force_llm:
+            self.project_summary = deterministic
+            return deterministic
+
+        prompt = f"Provide a concise architecture overview for: {deterministic}"
         try:
             res = await safe_chat_completion(
                 model=self.model_name,
@@ -2189,12 +2401,11 @@ Keep it under 3-4 paragraphs.
             )
             self.project_summary = res.choices[0].message.content.strip()
             return self.project_summary
-        except Exception as e:
-            print(f"   ⚠️ Project overview failed: {e}")
-            return "Multi-repository software project."
+        except Exception:
+            self.project_summary = deterministic
+            return deterministic
 
     def save(self, filepath: str):
-        """Save summaries to disk."""
         data = {
             "file_summaries": self.file_summaries,
             "folder_summaries": self.folder_summaries,
@@ -2204,7 +2415,6 @@ Keep it under 3-4 paragraphs.
             json.dump(data, f, indent=2)
 
     def load(self, filepath: str):
-        """Load summaries from disk."""
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
                 data = json.load(f)
@@ -2319,6 +2529,101 @@ class ImportResolver:
         return self.import_map.get(filepath, {}).get(symbol)
 
 # --- 4. Vector Embedding System ---
+
+class GraphStorageService:
+    """SQLite-backed graph storage that mimics a graph DB with Cypher-like query helpers."""
+
+    def __init__(self, db_path: str = GRAPH_DB_FILE):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self._init_schema()
+
+    def _init_schema(self):
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS functions (
+            id TEXT PRIMARY KEY,
+            repo TEXT,
+            file TEXT,
+            name TEXT,
+            node_type TEXT,
+            payload TEXT
+        )
+        """)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS calls (
+            source_id TEXT,
+            target_name TEXT,
+            FOREIGN KEY(source_id) REFERENCES functions(id)
+        )
+        """)
+        self.conn.commit()
+
+    def upsert_repo_graph(self, repo_name: str, graph: Dict[str, Dict], changed_files: Optional[Set[str]] = None):
+        changed_files = changed_files or {node.get('file') for node in graph.values()}
+        changed_files = {f for f in changed_files if f}
+        if changed_files:
+            placeholders = ','.join(['?'] * len(changed_files))
+            self.conn.execute(f"DELETE FROM calls WHERE source_id IN (SELECT id FROM functions WHERE repo = ? AND file IN ({placeholders}))", [repo_name, *changed_files])
+            self.conn.execute(f"DELETE FROM functions WHERE repo = ? AND file IN ({placeholders})", [repo_name, *changed_files])
+
+        for node_id, node in graph.items():
+            payload = json.dumps(node)
+            symbol = node.get('symbol', {})
+            self.conn.execute(
+                "INSERT OR REPLACE INTO functions (id, repo, file, name, node_type, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (node_id, repo_name, node.get('file'), symbol.get('name', node_id), symbol.get('type', ''), payload)
+            )
+            for call in symbol.get('calls', []):
+                self.conn.execute("INSERT INTO calls (source_id, target_name) VALUES (?, ?)", (node_id, call))
+
+        self.conn.commit()
+
+    def impact_analysis(self, target_name: str, max_depth: int = 4) -> List[str]:
+        frontier = [target_name]
+        impacted = set()
+        depth = 0
+        while frontier and depth < max_depth:
+            placeholders = ','.join(['?'] * len(frontier))
+            rows = self.conn.execute(
+                f"SELECT source_id FROM calls WHERE target_name IN ({placeholders})",
+                frontier
+            ).fetchall()
+            frontier = []
+            for (source_id,) in rows:
+                if source_id not in impacted:
+                    impacted.add(source_id)
+                    frontier.append(source_id.split('::')[-1])
+            depth += 1
+        return sorted(impacted)
+
+
+class HybridVectorStoreService:
+    """Pluggable vector service adapter (Qdrant/Weaviate-ready)."""
+
+    def __init__(self, backend: str = "local", storage_path: str = VECTOR_DB_FILE):
+        self.backend = backend
+        self.storage_path = storage_path
+        self.records: Dict[str, Dict[str, Any]] = {}
+
+    async def upsert_records(self, graph: Dict[str, Dict], changed_ids: Optional[Set[str]] = None):
+        changed_ids = changed_ids or set(graph.keys())
+        for node_id in changed_ids:
+            node = graph.get(node_id)
+            if not node:
+                continue
+            symbol = node.get('symbol', {})
+            text = f"{symbol.get('name', '')} {symbol.get('docstring', '')} {' '.join(symbol.get('arg_names', []))}"
+            self.records[node_id] = {
+                "text": text[:4000],
+                "repo": node.get('repo'),
+                "file": node.get('file')
+            }
+
+        os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+        with open(self.storage_path, 'w', encoding='utf-8') as f:
+            json.dump(self.records, f, indent=2)
+
 
 class VectorEmbeddingStore:
     """Stores and searches function embeddings using FAISS + sparse hybrid scoring."""
@@ -3229,6 +3534,8 @@ async def build_multi_symbol_graph(
 
     multi_graph = {}
     resolvers = {}
+    graph_storage = GraphStorageService()
+    hybrid_vector_service = HybridVectorStoreService()
 
     for repo_name, files_data in multi_repo_data.items():
         prev_repo_hashes = (previous_file_hashes or {}).get(repo_name, {})
@@ -3247,23 +3554,21 @@ async def build_multi_symbol_graph(
             changed_files=changed_files if previous_graph else None
         )
 
-        print(f"   📝 Summarizing {len(files_data)} files in [{repo_name}]...")
+        print(f"   📝 Building lightweight signatures for {len(files_data)} files in [{repo_name}]...")
         if changed_files:
             print(f"      ♻️ Partial re-index: {len(changed_files)} changed file(s) in [{repo_name}]")
-        semaphore = asyncio.Semaphore(10)
 
-        async def _summarize_one(fname: str, data: Dict[str, str]):
-            async with semaphore:
-                if changed_files and fname not in changed_files and fname in summarizer.file_summaries:
-                    return
-                symbol_names = [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == fname]
-                await summarizer.summarize_file(fname, data['content'], symbol_names)
+        for fname, data in files_data.items():
+            if changed_files and fname not in changed_files and fname in summarizer.file_summaries:
+                continue
+            symbol_names = [{"name": k.split("::")[-1]} for k in graph.keys() if graph[k]['file'] == fname]
+            await summarizer.summarize_file(fname, data['content'], symbol_names)
 
-        await asyncio.gather(*[_summarize_one(filename, data) for filename, data in files_data.items()])
         await summarizer.build_hierarchical_summaries(repo_name, files_data)
 
         multi_graph[repo_name] = graph
         resolvers[repo_name] = resolver
+        graph_storage.upsert_repo_graph(repo_name, graph, changed_files=changed_files if previous_graph else None)
 
     multi_graph = link_cross_repo_dependencies(multi_graph)
     dep_conflicts = _detect_dependency_version_conflicts(multi_graph)
@@ -3273,7 +3578,7 @@ async def build_multi_symbol_graph(
             print(f"   - {c['dependency']}: {', '.join(c['versions'])}")
             for repo, ver in c.get('repos', []):
                 print(f"      · {repo}: {ver}")
-    await summarizer.generate_project_overview(multi_graph)
+    await summarizer.generate_project_overview(multi_graph, force_llm=False)
 
     vector_stores = {}
     has_nodes = any(len(graph) > 0 for graph in multi_graph.values())
@@ -3318,6 +3623,9 @@ async def build_multi_symbol_graph(
 
     with open(GRAPH_FILE, 'w') as f:
         json.dump(multi_graph, f, indent=2)
+
+    for repo_name, graph in multi_graph.items():
+        await hybrid_vector_service.upsert_records(graph)
 
     try:
         export_graph_visualizations(multi_graph, VISUALIZATION_DIR)
@@ -4140,11 +4448,10 @@ async def main():
         if not gh_input.strip():
             return
         
-        multi_repo_data, repo_hashes = await ingest_sources(gh_input)
+        multi_repo_data, repo_hashes, current_file_hashes = await ingest_sources(gh_input)
         if not multi_repo_data:
             return
 
-        current_file_hashes = compute_multi_repo_file_hashes(multi_repo_data)
         cache_key_payload = {"repo_hashes": repo_hashes, "file_hashes": current_file_hashes}
 
         cached = load_cache(cache_key_payload, summarizer)
