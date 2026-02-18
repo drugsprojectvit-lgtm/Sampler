@@ -1595,42 +1595,58 @@ class TreeSitterParser:
             symbol_code = self._get_text(ast_node, content)
             symbol_name = info['name'] or f"anonymous_{ast_node.start_point[0]+1}"
             kind = info['kind'] or 'function'
+
+            # --- META EXTRACTION ---
             comment_meta = self._extract_symbol_docs(ast_node, content, symbol_code, language_name)
             semantic_meta = self._extract_semantic_metadata_from_node(ast_node, content)
-            calls = self._extract_api_calls(symbol_code)
+
+            # --- CALL EXTRACTION (Regex fallback for internal calls) ---
+            api_calls = self._extract_api_calls(symbol_code)
+            internal_calls = set(re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', symbol_code))
+            keywords = {
+                'if', 'for', 'while', 'switch', 'catch', 'func', 'def', 'class', 'return', 'await'
+            }
+            valid_calls = list(internal_calls - keywords)
+
             nodes.append({
                 "name": symbol_name,
                 "type": kind,
                 "code": symbol_code,
-                "calls": calls,
+                "calls": valid_calls,
                 "api_route": None,
-                "api_outbound": calls,
+                "api_outbound": api_calls,
                 "bases": [],
                 **comment_meta,
                 **semantic_meta
             })
 
         return {"nodes": nodes, "imports": list(dict.fromkeys(imports)), "globals": ""}
-
     def _extract_symbols(self, root_node, content: str, ext: str) -> Dict[str, Any]:
-        """Extract functions, classes, and imports from AST."""
-        if ext == '.py':
-            return self._extract_python(root_node, content)
-        elif ext in ['.js', '.jsx', '.ts', '.tsx']:
-            return self._extract_javascript(root_node, content)
-        elif ext == '.java':
+        """
+        Main entry point.
+        1. Tries to use .scm queries (Python, JS, TS, Go).
+        2. Falls back to manual extraction for others (Java, C++, Rust).
+        """
+        lang_map = {
+            '.py': 'python', '.js': 'javascript', '.jsx': 'javascript',
+            '.ts': 'typescript', '.tsx': 'typescript', '.go': 'go'
+        }
+
+        if ext in lang_map:
+            result = self._extract_symbols_with_queries(root_node, content, ext)
+            if result['nodes']:
+                return result
+
+        if ext == '.java':
             return self._extract_java(root_node, content)
-        elif ext == '.go':
-            return self._extract_go(root_node, content)
         elif ext == '.rs':
             return self._extract_rust(root_node, content)
         elif ext in ['.cpp', '.cc', '.hpp', '.c', '.h', '.ino']:
             return self._extract_cpp(root_node, content)
         elif ext in ['.sh', '.bash']:
             return self._extract_bash(root_node, content)
-        else:
-            return {"nodes": [], "imports": [], "globals": ""}
 
+        return {"nodes": [], "imports": [], "globals": ""}
     def _get_text(self, node, content: str) -> str:
         """Extract text from a node."""
         return content[node.start_byte:node.end_byte]
@@ -1698,15 +1714,6 @@ class TreeSitterParser:
         meta['exception_types'] = sorted(exc_seen)
         return meta
 
-    def _extract_python_bases(self, class_node, content: str) -> List[str]:
-        bases = []
-        sup = class_node.child_by_field_name('superclasses')
-        if sup:
-            for ch in sup.children:
-                if ch.type in ['identifier', 'attribute']:
-                    bases.append(self._get_text(ch, content).split('.')[-1])
-        return list(dict.fromkeys(bases))
-
     def _extract_class_bases_generic(self, class_node, content: str) -> List[str]:
         bases = []
         for field_name in ['superclass', 'interfaces', 'extends_clause', 'implements_clause']:
@@ -1716,231 +1723,6 @@ class TreeSitterParser:
                     if ch.type in ['identifier', 'type_identifier', 'scoped_identifier']:
                         bases.append(self._get_text(ch, content).split('.')[-1])
         return list(dict.fromkeys(bases))
-
-    def _extract_python(self, root, content: str) -> Dict[str, Any]:
-        """Extract Python symbols."""
-        nodes = []
-        imports = []
-
-        def visit(node, namespace=""):
-            if node.type in ['import_statement', 'import_from_statement']:
-                imports.append(self._get_text(node, content))
-
-            elif node.type == 'function_definition':
-                func_name_node = node.child_by_field_name('name')
-                if func_name_node:
-                    name = self._get_text(func_name_node, content)
-                    full_name = f"{namespace}.{name}" if namespace else name
-                    code = self._get_text(node, content)
-                    calls = self._extract_calls_python(node, content)
-                    api_route = self._extract_python_route(node, content)
-                    api_calls = self._extract_api_calls(code)
-                    comment_meta = self._extract_symbol_docs(node, content, code, 'python')
-                    semantic_meta = _extract_python_semantic_metadata(code)
-
-                    nodes.append({
-                        "name": full_name,
-                        "type": "function",
-                        "code": code,
-                        "calls": calls,
-                        "api_route": api_route,
-                        "api_outbound": api_calls,
-                        "bases": [],
-                        **comment_meta,
-                        **semantic_meta
-                    })
-
-            elif node.type == 'class_definition':
-                class_name_node = node.child_by_field_name('name')
-                if class_name_node:
-                    class_name = self._get_text(class_name_node, content)
-                    full_name = f"{namespace}.{class_name}" if namespace else class_name
-                    bases = self._extract_python_bases(node, content)
-                    class_code = self._get_text(node, content)
-                    comment_meta = self._extract_symbol_docs(node, content, class_code, 'python')
-                    nodes.append({
-                        "name": full_name,
-                        "type": "class",
-                        "code": class_code,
-                        "calls": [],
-                        "api_route": None,
-                        "api_outbound": [],
-                        "bases": bases,
-                        **comment_meta,
-                        "arg_names": [],
-                        "arg_types": [],
-                        "return_type": None,
-                        "variable_mentions": [],
-                        "exception_types": [],
-                        "decorators": []
-                    })
-                    for child in node.children:
-                        visit(child, full_name)
-                    return
-
-            for child in node.children:
-                visit(child, namespace)
-
-        visit(root)
-        return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
-
-    def _extract_calls_python(self, func_node, content: str) -> List[str]:
-        """Extract function calls from Python function."""
-        calls = set()
-        
-        def visit(node):
-            if node.type == 'call':
-                func_node = node.child_by_field_name('function')
-                if func_node:
-                    if func_node.type == 'identifier':
-                        calls.add(self._get_text(func_node, content))
-                    elif func_node.type == 'attribute':
-                        attr = func_node.child_by_field_name('attribute')
-                        if attr:
-                            calls.add(self._get_text(attr, content))
-            
-            for child in node.children:
-                visit(child)
-        
-        visit(func_node)
-        return list(calls)
-
-    def _extract_python_route(self, func_node, content: str) -> Optional[str]:
-        """Extract API route from Python decorators."""
-        prev = func_node.prev_sibling
-        while prev and prev.type == 'decorator':
-            decorator_text = self._get_text(prev, content)
-            for pattern in self.API_ROUTE_PATTERNS:
-                match = re.search(pattern, decorator_text)
-                if match:
-                    return normalize_route(match.group(1))
-            prev = prev.prev_sibling
-        return None
-
-    def _extract_javascript(self, root, content: str) -> Dict[str, Any]:
-        """Extract JavaScript/TypeScript symbols."""
-        nodes = []
-        imports = []
-
-        def visit(node, namespace=""):
-            if node.type in ['import_statement', 'import_clause']:
-                imports.append(self._get_text(node, content))
-
-            elif node.type == 'function_declaration':
-                name_node = node.child_by_field_name('name')
-                if name_node:
-                    name = self._get_text(name_node, content)
-                    code = self._get_text(node, content)
-                    calls = self._extract_calls_js(node, content)
-                    api_calls = self._extract_api_calls(code)
-                    comment_meta = self._extract_symbol_docs(node, content, code, 'javascript')
-                    semantic_meta = self._extract_semantic_metadata_from_node(node, content)
-                    nodes.append({
-                        "name": name,
-                        "type": "function",
-                        "code": code,
-                        "calls": calls,
-                        "api_route": None,
-                        "api_outbound": api_calls,
-                        "bases": [],
-                        **comment_meta,
-                        **semantic_meta
-                    })
-
-            elif node.type == 'lexical_declaration':
-                for child in node.children:
-                    if child.type == 'variable_declarator':
-                        name_node = child.child_by_field_name('name')
-                        value_node = child.child_by_field_name('value')
-                        if name_node and value_node and value_node.type in ['arrow_function', 'function']:
-                            name = self._get_text(name_node, content)
-                            code = self._get_text(child, content)
-                            calls = self._extract_calls_js(value_node, content)
-                            api_calls = self._extract_api_calls(code)
-                            comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
-                            semantic_meta = self._extract_semantic_metadata_from_node(value_node, content)
-                            nodes.append({
-                                "name": name,
-                                "type": "function",
-                                "code": code,
-                                "calls": calls,
-                                "api_route": None,
-                                "api_outbound": api_calls,
-                                "bases": [],
-                                **comment_meta,
-                                **semantic_meta
-                            })
-
-            elif node.type == 'class_declaration':
-                name_node = node.child_by_field_name('name')
-                if name_node:
-                    class_name = self._get_text(name_node, content)
-                    bases = self._extract_class_bases_generic(node, content)
-                    class_code = self._get_text(node, content)
-                    comment_meta = self._extract_symbol_docs(node, content, class_code, 'javascript')
-                    nodes.append({
-                        "name": class_name,
-                        "type": "class",
-                        "code": class_code,
-                        "calls": [],
-                        "api_route": None,
-                        "api_outbound": [],
-                        "bases": bases,
-                        **comment_meta,
-                        "arg_names": [], "arg_types": [], "return_type": None,
-                        "variable_mentions": [], "exception_types": [], "decorators": []
-                    })
-                    body = node.child_by_field_name('body')
-                    if body:
-                        for child in body.children:
-                            if child.type == 'method_definition':
-                                method_name_node = child.child_by_field_name('name')
-                                if method_name_node:
-                                    method_name = self._get_text(method_name_node, content)
-                                    full_name = f"{class_name}.{method_name}"
-                                    code = self._get_text(child, content)
-                                    calls = self._extract_calls_js(child, content)
-                                    api_calls = self._extract_api_calls(code)
-                                    comment_meta = self._extract_symbol_docs(child, content, code, 'javascript')
-                                    semantic_meta = self._extract_semantic_metadata_from_node(child, content)
-                                    nodes.append({
-                                        "name": full_name,
-                                        "type": "method",
-                                        "code": code,
-                                        "calls": calls,
-                                        "api_route": None,
-                                        "api_outbound": api_calls,
-                                        "bases": [],
-                                        **comment_meta,
-                                        **semantic_meta
-                                    })
-
-            for child in node.children:
-                visit(child, namespace)
-
-        visit(root)
-        return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
-
-    def _extract_calls_js(self, node, content: str) -> List[str]:
-        """Extract function calls from JS/TS code."""
-        calls = set()
-        
-        def visit(n):
-            if n.type == 'call_expression':
-                func = n.child_by_field_name('function')
-                if func:
-                    if func.type == 'identifier':
-                        calls.add(self._get_text(func, content))
-                    elif func.type == 'member_expression':
-                        prop = func.child_by_field_name('property')
-                        if prop:
-                            calls.add(self._get_text(prop, content))
-            
-            for child in n.children:
-                visit(child)
-        
-        visit(node)
-        return list(calls)
 
     def _extract_java(self, root, content: str) -> Dict[str, Any]:
         """Extract Java symbols."""
@@ -2037,63 +1819,6 @@ class TreeSitterParser:
                         return normalize_route(match.group(1))
             prev = prev.prev_sibling
         return None
-
-    def _extract_go(self, root, content: str) -> Dict[str, Any]:
-        """Extract Go symbols."""
-        nodes = []
-        imports = []
-
-        def visit(node):
-            if node.type == 'import_declaration':
-                imports.append(self._get_text(node, content))
-
-            elif node.type == 'function_declaration':
-                name_node = node.child_by_field_name('name')
-                if name_node:
-                    name = self._get_text(name_node, content)
-                    code = self._get_text(node, content)
-                    calls = self._extract_calls_go(node, content)
-                    api_calls = self._extract_api_calls(code)
-                    comment_meta = self._extract_symbol_docs(node, content, code, 'other')
-                    semantic_meta = self._extract_semantic_metadata_from_node(node, content)
-                    nodes.append({
-                        "name": name,
-                        "type": "function",
-                        "code": code,
-                        "calls": calls,
-                        "api_route": None,
-                        "api_outbound": api_calls,
-                        "bases": [],
-                        **comment_meta,
-                        **semantic_meta
-                    })
-
-            for child in node.children:
-                visit(child)
-
-        visit(root)
-        return {"nodes": nodes, "imports": imports, "globals": "\n".join(imports)}
-
-    def _extract_calls_go(self, node, content: str) -> List[str]:
-        """Extract function calls from Go code."""
-        calls = set()
-        
-        def visit(n):
-            if n.type == 'call_expression':
-                func = n.child_by_field_name('function')
-                if func:
-                    if func.type == 'identifier':
-                        calls.add(self._get_text(func, content))
-                    elif func.type == 'selector_expression':
-                        field = func.child_by_field_name('field')
-                        if field:
-                            calls.add(self._get_text(field, content))
-            
-            for child in n.children:
-                visit(child)
-        
-        visit(node)
-        return list(calls)
 
     def _extract_rust(self, root, content: str) -> Dict[str, Any]:
         """Extract Rust symbols."""
